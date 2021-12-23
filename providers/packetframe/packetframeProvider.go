@@ -137,7 +137,6 @@ func (api *packetframeProvider) GetDomainCorrections(dc *models.DomainConfig) ([
 	if err != nil {
 		return nil, fmt.Errorf("could not load records for '%s'", dc.Name)
 	}
-	log.Printf("I see %d records for the zone %s\n", len(records), dc.Name)
 
 	existingRecords := make([]*models.RecordConfig, len(records))
 
@@ -149,7 +148,7 @@ func (api *packetframeProvider) GetDomainCorrections(dc *models.DomainConfig) ([
 	models.PostProcessRecords(existingRecords)
 
 	differ := diff.New(dc)
-	_, create, delete, _, err := differ.IncrementalDiff(existingRecords)
+	_, create, delete, modify, err := differ.IncrementalDiff(existingRecords)
 	if err != nil {
 		return nil, err
 	}
@@ -170,7 +169,7 @@ func (api *packetframeProvider) GetDomainCorrections(dc *models.DomainConfig) ([
 		corr := &models.Correction{
 			Msg: fmt.Sprintf("%s: %s", m.String(), string(j)),
 			F: func() error {
-				_, err := api.createRecord(zone.ID, req)
+				_, err := api.createRecord(req)
 				return err
 			},
 		}
@@ -183,6 +182,20 @@ func (api *packetframeProvider) GetDomainCorrections(dc *models.DomainConfig) ([
 			Msg: fmt.Sprintf("Deleting record %s from %s", original.ID, zone.Zone),
 			F: func() error {
 				err := api.deleteRecord(zone.ID, original.ID)
+				return err
+			},
+		}
+		corrections = append(corrections, corr)
+	}
+
+	for _, m := range modify {
+		original := m.Existing.Original.(*domainRecord)
+		req, _ := toReq(zone.ID, dc, m.Desired)
+		req.ID = original.ID
+		corr := &models.Correction{
+			Msg: fmt.Sprintf("Modifying record %s from %s", original.ID, zone.Zone),
+			F: func() error {
+				err := api.modifyRecord(req)
 				return err
 			},
 		}
@@ -225,7 +238,8 @@ func toRc(dc *models.DomainConfig, r *domainRecord) *models.RecordConfig {
 
 	switch rtype := r.Type; rtype { // #rtype_variations
 	case "TXT":
-		rc.SetTargetTXT(r.Value[1 : len(r.Value)-1])
+		fmt.Printf("TXT Record with value %s\n", r.Value)
+		rc.SetTargetTXTString(r.Value)
 	case "SRV":
 		spl := strings.Split(r.Value, " ")
 		prio, _ := strconv.ParseUint(spl[0], 10, 16)

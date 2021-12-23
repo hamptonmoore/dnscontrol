@@ -37,15 +37,12 @@ func (c *packetframeProvider) getRecords(zoneID string) ([]domainRecord, error) 
 	if err := c.get(endpoint, dr); err != nil {
 		return records, fmt.Errorf("failed fetching domain list (Packetframe): %s", err)
 	}
-	for _, record := range dr.Data.Records {
-		records = append(records, record)
-	}
+	records = append(records, dr.Data.Records...)
 
 	return records, nil
 }
 
-func (c *packetframeProvider) createRecord(zoneID string, rec *domainRecord) (*domainRecord, error) {
-	log.Println("MADE DOMAIN RECORD")
+func (c *packetframeProvider) createRecord(rec *domainRecord) (*domainRecord, error) {
 	endpoint := fmt.Sprintf("dns/records")
 
 	req, err := c.newRequest(http.MethodPost, endpoint, rec)
@@ -53,45 +50,31 @@ func (c *packetframeProvider) createRecord(zoneID string, rec *domainRecord) (*d
 		return nil, err
 	}
 
-	resp, err := c.client.Do(req)
+	_, err = c.client.Do(req)
 	if err != nil {
 		fmt.Println("ERROR")
 		return nil, err
 	}
 
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	log.Println(string(body))
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, c.handleErrors(resp)
-	}
-
-	record := &domainRecord{}
-
-	defer resp.Body.Close()
-	decoder := json.NewDecoder(resp.Body)
-	if err := decoder.Decode(record); err != nil {
-		return nil, err
-	}
-
-	return record, nil
+	return rec, nil
 }
 
-// func (c *packetframeProvider) modifyRecord(zoneName string, recordID int, rec *domainRecord) error {
-// 	_, err := c.createRecord(zoneName, rec)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	err = c.deleteRecord(zoneName, recordID)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	return nil
-// }
+func (c *packetframeProvider) modifyRecord(rec *domainRecord) error {
+	endpoint := fmt.Sprintf("dns/records")
+
+	req, err := c.newRequest(http.MethodPut, endpoint, rec)
+	if err != nil {
+		return err
+	}
+
+	_, err = c.client.Do(req)
+	if err != nil {
+		fmt.Println("ERROR")
+		return err
+	}
+
+	return nil
+}
 
 func (c *packetframeProvider) deleteRecord(zoneID string, recordID string) error {
 	endpoint := "dns/records"
