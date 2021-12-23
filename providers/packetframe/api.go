@@ -3,7 +3,6 @@ package packetframe
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -13,27 +12,41 @@ import (
 
 const (
 	mediaType      = "application/json"
-	defaultBaseURL = "https://packetframe.com/api/"
+	defaultBaseURL = "https://v4.packetframe.com/api/"
 )
 
 func (c *packetframeProvider) fetchDomainList() error {
-	c.domainIndex = map[string]domain{}
+	c.domainIndex = map[string]zone{}
 	dr := &domainResponse{}
-	endpoint := "zones/list"
+	endpoint := "dns/zones"
 	if err := c.get(endpoint, dr); err != nil {
 		return fmt.Errorf("failed fetching domain list (Packetframe): %s", err)
 	}
-	for _, domain := range dr.Message {
-		c.domainIndex[domain.Zone] = domain
-		// log.Printf("%s zone detected", domain.Zone)
+	for _, zone := range dr.Data.Zones {
+		c.domainIndex[zone.Zone] = zone
+		log.Printf("%s zone detected", zone.Zone)
 	}
 
 	return nil
 }
 
-func (c *packetframeProvider) createRecord(zoneName string, rec *domainRecord) (*domainRecord, error) {
-	log.Println("MADE DOMAIN")
-	endpoint := fmt.Sprintf("zone/%s/add", zoneName)
+func (c *packetframeProvider) getRecords(zoneID string) ([]domainRecord, error) {
+	var records []domainRecord
+	dr := &recordResponse{}
+	endpoint := fmt.Sprintf("dns/records/%s", zoneID)
+	if err := c.get(endpoint, dr); err != nil {
+		return records, fmt.Errorf("failed fetching domain list (Packetframe): %s", err)
+	}
+	for _, record := range dr.Data.Records {
+		records = append(records, record)
+	}
+
+	return records, nil
+}
+
+func (c *packetframeProvider) createRecord(zoneID string, rec *domainRecord) (*domainRecord, error) {
+	log.Println("MADE DOMAIN RECORD")
+	endpoint := fmt.Sprintf("dns/records")
 
 	req, err := c.newRequest(http.MethodPost, endpoint, rec)
 	if err != nil {
@@ -68,21 +81,21 @@ func (c *packetframeProvider) createRecord(zoneName string, rec *domainRecord) (
 	return record, nil
 }
 
-func (c *packetframeProvider) modifyRecord(zoneName string, recordID int, rec *domainRecord) error {
-	_, err := c.createRecord(zoneName, rec)
-	if err != nil {
-		return err
-	}
-	err = c.deleteRecord(zoneName, recordID)
-	if err != nil {
-		return err
-	}
-	return nil
-}
+// func (c *packetframeProvider) modifyRecord(zoneName string, recordID int, rec *domainRecord) error {
+// 	_, err := c.createRecord(zoneName, rec)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	err = c.deleteRecord(zoneName, recordID)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	return nil
+// }
 
-func (c *packetframeProvider) deleteRecord(zoneName string, recordID int) error {
-	endpoint := fmt.Sprintf("zone/%s/delete_record/%d", zoneName, recordID)
-	req, err := c.newRequest(http.MethodDelete, endpoint, nil)
+func (c *packetframeProvider) deleteRecord(zoneID string, recordID string) error {
+	endpoint := "dns/records"
+	req, err := c.newRequest(http.MethodDelete, endpoint, deleteRequest{Zone: zoneID, Record: recordID})
 	if err != nil {
 		return err
 	}
@@ -143,67 +156,49 @@ func (c *packetframeProvider) get(endpoint string, target interface{}) error {
 }
 
 func (c *packetframeProvider) handleErrors(resp *http.Response) error {
-	defer resp.Body.Close()
-	fmt.Println("ERROR")
-	decoder := json.NewDecoder(resp.Body)
-
-	errs := &errorResponse{}
-
-	if err := decoder.Decode(errs); err != nil {
-		return fmt.Errorf("bad status code from Packetframe: %d not 200. Failed to decode response", resp.StatusCode)
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	buf := bytes.NewBufferString(fmt.Sprintf("bad status code from Packetframe: %d not 200", resp.StatusCode))
-
-	for _, err := range errs.Errors {
-		buf.WriteString("\n- ")
-
-		if err.Field != "" {
-			buf.WriteString(err.Field)
-			buf.WriteString(": ")
-		}
-
-		buf.WriteString(err.Reason)
-	}
-
-	return errors.New(buf.String())
+	log.Println(string(body))
+	return nil
 }
 
-type basicResponse struct {
-	Results int `json:"results"`
-	Pages   int `json:"pages"`
-	Page    int `json:"page"`
-}
-
-type domain struct {
-	Records []domainRecord `json:"records"`
-	Serial  string         `json:"serial"`
-	Type    string         `json:"type"`
-	Users   []string       `json:"users"`
-	Zone    string         `json:zone`
+type zone struct {
+	ID         string   `json:"id"`
+	Zone       string   `json:zone`
+	Users      []string `json:"users"`
+	UserEmails []string `json:"user_emails"`
 }
 
 type domainResponse struct {
-	Message []domain `json:"message"`
-	Success bool     `json:"success"`
+	Data struct {
+		Zones []zone `json:"zones"`
+	} `json:"data"`
+	Message string `json:"message"`
+	Success bool   `json:"success"`
+}
+
+type deleteRequest struct {
+	Record string `json:"record"`
+	Zone   string `json:"zone"`
 }
 
 type recordResponse struct {
-	basicResponse
-	Data []domainRecord `json:"data"`
+	Data struct {
+		Records []domainRecord `json:"records"`
+	} `json:"data"`
+	Message string `json:"message"`
+	Success bool   `json:"success"`
 }
 
 type domainRecord struct {
-	Label   string `json:"label"`
-	TTL     int    `json:"ttl"`
-	Type    string `json:"type"`
-	Value   string `json:"value"`
-	Proxied bool   `json:"proxied"`
-}
-
-type errorResponse struct {
-	Errors []struct {
-		Field  string `json:"field"`
-		Reason string `json:"reason"`
-	} `json:"errors"`
+	ID    string `json:"id"`
+	Type  string `json:"type"`
+	Label string `json:"label"`
+	Value string `json:"value"`
+	TTL   int    `json:"ttl"`
+	Proxy bool   `json:"proxy"`
+	Zone  string `json:zone`
 }

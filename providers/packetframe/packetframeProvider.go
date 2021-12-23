@@ -3,26 +3,28 @@ package packetframe
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"strconv"
+	"strings"
 
 	"github.com/StackExchange/dnscontrol/v3/models"
 	"github.com/StackExchange/dnscontrol/v3/pkg/diff"
 	"github.com/StackExchange/dnscontrol/v3/providers"
-	"github.com/miekg/dns/dnsutil"
 )
 
 // packetframeProvider is the handle for this provider.
 type packetframeProvider struct {
 	client      *http.Client
 	baseURL     *url.URL
-	domainIndex map[string]domain
+	domainIndex map[string]zone
 }
 
 var defaultNameServerNames = []string{
-	"ns1.packetframe.com",
-	"ns2.packetframe.com",
+	"ns1v4.packetframe.com",
+	"ns2v4.packetframe.com",
 }
 
 // NewPacketframe creates the provider.
@@ -32,12 +34,13 @@ func NewPacketframe(m map[string]string, metadata json.RawMessage) (providers.DN
 	}
 
 	cookie := &http.Cookie{
-		Name:  "apikey",
-		Value: m["apikey"],
+		Name:     "token",
+		Value:    m["apikey"],
+		HttpOnly: true,
 	}
 	cookies := make([]*http.Cookie, 1)
 	cookies[0] = cookie
-	urlObj, _ := url.Parse("https://packetframe.com/")
+	urlObj, _ := url.Parse("https://v4.packetframe.com/")
 	jar, _ := cookiejar.New(nil)
 	jar.SetCookies(urlObj, cookies)
 
@@ -60,6 +63,7 @@ func NewPacketframe(m map[string]string, metadata json.RawMessage) (providers.DN
 var features = providers.DocumentationNotes{
 	providers.DocDualHost:            providers.Cannot(),
 	providers.DocOfficiallySupported: providers.Cannot(),
+	providers.CanUseSRV:              providers.Can(),
 	providers.CanGetZones:            providers.Unimplemented(),
 }
 
@@ -78,10 +82,36 @@ func (api *packetframeProvider) GetNameservers(domain string) ([]*models.Nameser
 
 // GetZoneRecords gets the records of a zone and returns them in RecordConfig format.
 func (api *packetframeProvider) GetZoneRecords(domain string) (models.Records, error) {
-	return nil, fmt.Errorf("not implemented")
+
+	if api.domainIndex == nil {
+		if err := api.fetchDomainList(); err != nil {
+			return nil, err
+		}
+	}
+	zone, ok := api.domainIndex[domain+"."]
+	if !ok {
+		return nil, fmt.Errorf("'%s' not a zone in Packetframe account", domain)
+	}
+
+	records, err := api.getRecords(zone.ID)
+	if err != nil {
+		return nil, fmt.Errorf("could not load records for '%s'", domain)
+	}
 	// This enables the get-zones subcommand.
 	// Implement this by extracting the code from GetDomainCorrections into
 	// a single function.  For most providers this should be relatively easy.
+
+	existingRecords := make([]*models.RecordConfig, len(records))
+
+	dc := models.DomainConfig{
+		Name: domain,
+	}
+
+	for i := range records {
+		existingRecords[i] = toRc(&dc, &records[i])
+	}
+
+	return existingRecords, nil
 }
 
 // GetDomainCorrections returns the corrections for a domain.
@@ -98,12 +128,16 @@ func (api *packetframeProvider) GetDomainCorrections(dc *models.DomainConfig) ([
 			return nil, err
 		}
 	}
-	_, ok := api.domainIndex[dc.Name]
+	zone, ok := api.domainIndex[dc.Name+"."]
 	if !ok {
 		return nil, fmt.Errorf("'%s' not a zone in Packetframe account", dc.Name)
 	}
 
-	records := api.domainIndex[dc.Name].Records
+	records, err := api.getRecords(zone.ID)
+	if err != nil {
+		return nil, fmt.Errorf("could not load records for '%s'", dc.Name)
+	}
+	log.Printf("I see %d records for the zone %s\n", len(records), dc.Name)
 
 	existingRecords := make([]*models.RecordConfig, len(records))
 
@@ -112,17 +146,10 @@ func (api *packetframeProvider) GetDomainCorrections(dc *models.DomainConfig) ([
 	}
 
 	// Normalize
-	// models.PostProcessRecords(existingRecords)
-
-	for _, record := range dc.Records {
-		if record.Name == "@" {
-			record.Name = dc.Name
-			record.NameFQDN = dc.Name + "."
-		}
-	}
+	models.PostProcessRecords(existingRecords)
 
 	differ := diff.New(dc)
-	_, create, _, _, err := differ.IncrementalDiff(existingRecords)
+	_, create, delete, _, err := differ.IncrementalDiff(existingRecords)
 	if err != nil {
 		return nil, err
 	}
@@ -131,16 +158,31 @@ func (api *packetframeProvider) GetDomainCorrections(dc *models.DomainConfig) ([
 
 	for _, m := range create {
 		// log.Println(m.Desired.String())
-		req, err := toReq(dc, m.Desired)
-		j, err := json.Marshal(req)
-		// log.Println(j)
+		req, err := toReq(zone.ID, dc, m.Desired)
 		if err != nil {
 			return nil, err
 		}
+		j, err := json.Marshal(req)
+		if err != nil {
+			return nil, err
+		}
+		log.Printf("Req content: %s\n", string(j))
 		corr := &models.Correction{
 			Msg: fmt.Sprintf("%s: %s", m.String(), string(j)),
 			F: func() error {
-				_, err := api.createRecord(dc.Name, req)
+				_, err := api.createRecord(zone.ID, req)
+				return err
+			},
+		}
+		corrections = append(corrections, corr)
+	}
+
+	for _, m := range delete {
+		original := m.Existing.Original.(*domainRecord)
+		corr := &models.Correction{
+			Msg: fmt.Sprintf("Deleting record %s from %s", original.ID, zone.Zone),
+			F: func() error {
+				err := api.deleteRecord(zone.ID, original.ID)
 				return err
 			},
 		}
@@ -150,16 +192,21 @@ func (api *packetframeProvider) GetDomainCorrections(dc *models.DomainConfig) ([
 	return corrections, nil
 }
 
-func toReq(dc *models.DomainConfig, rc *models.RecordConfig) (*domainRecord, error) {
+func toReq(zoneID string, dc *models.DomainConfig, rc *models.RecordConfig) (*domainRecord, error) {
 	req := &domainRecord{
 		Type:  rc.Type,
 		TTL:   int(rc.TTL),
-		Label: rc.GetLabelFQDN(),
+		Label: rc.GetLabel(),
+		Zone:  zoneID,
 	}
 
 	switch rc.Type { // #rtype_variations
-	case "A", "AAAA", "PTR", "TXT", "CNAME", "MX":
+	case "A", "AAAA", "PTR", "TXT", "CNAME", "NS":
 		req.Value = rc.GetTargetField()
+	case "MX":
+		req.Value = fmt.Sprintf("%d %s", rc.MxPreference, rc.GetTargetField())
+	case "SRV":
+		req.Value = fmt.Sprintf("%d %d %d %s", rc.SrvPriority, rc.SrvWeight, rc.SrvPort, rc.GetTargetField())
 	default:
 		return nil, fmt.Errorf("packetframe.toReq rtype %q unimplemented", rc.Type)
 	}
@@ -173,13 +220,22 @@ func toRc(dc *models.DomainConfig, r *domainRecord) *models.RecordConfig {
 		TTL:      uint32(r.TTL),
 		Original: r,
 	}
+
 	rc.SetLabel(r.Label, dc.Name)
 
 	switch rtype := r.Type; rtype { // #rtype_variations
 	case "TXT":
-		rc.SetTargetTXT(r.Value)
-	case "CNAME", "MX", "NS", "SRV":
-		rc.SetTarget(dnsutil.AddOrigin(r.Value+".", dc.Name))
+		rc.SetTargetTXT(r.Value[1 : len(r.Value)-1])
+	case "SRV":
+		spl := strings.Split(r.Value, " ")
+		prio, _ := strconv.ParseUint(spl[0], 10, 16)
+		weight, _ := strconv.ParseUint(spl[1], 10, 16)
+		port, _ := strconv.ParseUint(spl[2], 10, 16)
+		rc.SetTargetSRV(uint16(prio), uint16(weight), uint16(port), spl[3])
+	case "MX":
+		spl := strings.Split(r.Value, " ")
+		prio, _ := strconv.ParseUint(spl[0], 10, 16)
+		rc.SetTargetMX(uint16(prio), spl[1])
 	default:
 		rc.SetTarget(r.Value)
 	}
