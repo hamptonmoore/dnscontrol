@@ -3,7 +3,6 @@ package packetframe
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -156,18 +155,12 @@ func (api *packetframeProvider) GetDomainCorrections(dc *models.DomainConfig) ([
 	var corrections []*models.Correction
 
 	for _, m := range create {
-		// log.Println(m.Desired.String())
 		req, err := toReq(zone.ID, dc, m.Desired)
 		if err != nil {
 			return nil, err
 		}
-		j, err := json.Marshal(req)
-		if err != nil {
-			return nil, err
-		}
-		log.Printf("Req content: %s\n", string(j))
 		corr := &models.Correction{
-			Msg: fmt.Sprintf("%s: %s", m.String(), string(j)),
+			Msg: m.String(),
 			F: func() error {
 				_, err := api.createRecord(req)
 				return err

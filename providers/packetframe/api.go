@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"net/url"
 )
@@ -24,7 +23,6 @@ func (c *packetframeProvider) fetchDomainList() error {
 	}
 	for _, zone := range dr.Data.Zones {
 		c.domainIndex[zone.Zone] = zone
-		log.Printf("%s zone detected", zone.Zone)
 	}
 
 	return nil
@@ -141,11 +139,13 @@ func (c *packetframeProvider) get(endpoint string, target interface{}) error {
 func (c *packetframeProvider) handleErrors(resp *http.Response) error {
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 
-	log.Println(string(body))
-	return nil
+	dr := &domainResponse{}
+	json.Unmarshal(body, &dr)
+
+	return fmt.Errorf("packetframe API error: %s", dr.Message)
 }
 
 type zone struct {
